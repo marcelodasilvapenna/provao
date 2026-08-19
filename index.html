@@ -360,30 +360,24 @@
       <p class="hint">Questões com contorno vermelho tiveram leitura incerta (em branco ou dupla marcação) — confira e ajuste antes de salvar.</p>
       <div id="scoreArea" style="text-align:center;"></div>
       <div id="resultGrid"></div>
-      <button class="primary" id="btnSave" style="margin-top:10px;">Salvar resultado</button>
+      <button class="primary" id="btnSave" style="margin-top:10px;">Enviar para a planilha</button>
     </div>
   </section>
 
   <!-- STEP 4: RESULTS -->
   <section id="step-results" class="step">
     <div class="card">
-      <h2>Enviar para o Google Sheets</h2>
-      <p class="hint">Cole aqui a URL do App da Web do Google Apps Script (termina em /exec). Depois disso, cada aluno salvo é enviado automaticamente para a planilha.</p>
+      <h2>Integração com o Google Sheets</h2>
+      <p class="hint">Cole aqui a URL do App da Web do Google Apps Script (termina em /exec). Cada correção é enviada direto para a planilha — nada fica guardado neste celular.</p>
       <input type="text" id="sheetsUrl" placeholder="https://script.google.com/macros/s/.../exec" style="margin-bottom:8px;">
-      <div style="display:flex; gap:8px;">
-        <button class="secondary" id="btnSaveSheetsUrl">Salvar integração</button>
-        <button class="secondary" id="btnResendAll">Reenviar todos</button>
-      </div>
+      <button class="secondary" id="btnSaveSheetsUrl">Salvar integração</button>
       <div id="sheetsStatus" style="font-size:11px; color:var(--ink-soft); margin-top:6px;"></div>
     </div>
 
     <div class="card">
-      <h2>Alunos corrigidos</h2>
-      <div id="resultsTableWrap"><div class="empty">Nenhum resultado salvo ainda.</div></div>
-      <div style="margin-top:10px; display:flex; gap:8px;">
-        <button class="secondary" id="btnExport">Exportar CSV</button>
-        <button class="link" id="btnClearAll">Apagar todos os resultados</button>
-      </div>
+      <h2>Envios desta sessão</h2>
+      <p class="hint">Lista apenas para conferência enquanto o app está aberto — some ao fechar ou recarregar a página. A planilha é o registro oficial.</p>
+      <div id="sessionLog"><div class="empty">Nenhum envio ainda nesta sessão.</div></div>
     </div>
   </section>
 
@@ -477,7 +471,6 @@
   let state = {
     numOptions: 5,
     answerKey: Array(40).fill(null),
-    students: [],
     sheetsUrl: ''
   };
   let scan = {
@@ -494,11 +487,6 @@
       }));
     }catch(e){ /* armazenamento indisponível (ex: modo privado) */ }
   }
-  async function saveStudents(){
-    try{
-      localStorage.setItem('gabarito_students', JSON.stringify(state.students));
-    }catch(e){ /* armazenamento indisponível (ex: modo privado) */ }
-  }
   async function loadAll(){
     try{
       const c = localStorage.getItem('gabarito_config');
@@ -509,25 +497,48 @@
       }
     }catch(e){ /* sem configuração salva ainda */ }
     try{
-      const s = localStorage.getItem('gabarito_students');
-      if (s) state.students = JSON.parse(s);
-    }catch(e){ /* nenhum aluno salvo ainda */ }
-    try{
       const u = localStorage.getItem('gabarito_sheets_url');
       if (u) state.sheetsUrl = u;
     }catch(e){ /* nenhuma URL salva ainda */ }
   }
 
-  function sendToSheet(student){
-    if (!state.sheetsUrl) return Promise.resolve(false);
-    return fetch(state.sheetsUrl, {
-      method: 'POST',
-      mode: 'no-cors',
-      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify(student)
-    }).then(()=>true).catch(()=>false);
-    // mode:'no-cors' evita bloqueio de CORS do Apps Script, mas impede ler a resposta —
-    // por isso não é possível confirmar sucesso de fato, só que a requisição foi enviada.
+  // Envia a nota (POST) e depois confirma lendo de volta a célula (GET) — como nada
+  // fica salvo no celular, essa confirmação é o que garante que a nota realmente chegou.
+  async function sendToSheetAndVerify(record){
+    const notaEsperada = `${record.correct}/${record.total} (${record.pct}%)`;
+    try{
+      await fetch(state.sheetsUrl, {
+        method: 'POST',
+        mode: 'no-cors',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify(record)
+      });
+    }catch(e){
+      return { ok:false, motivo:'Falha de conexão ao enviar.' };
+    }
+    // pequena espera para o Apps Script processar antes de verificar
+    await new Promise(r=>setTimeout(r, 1200));
+    try{
+      const url = `${state.sheetsUrl}?action=verificar&sala=${encodeURIComponent(record.sala)}&linha=${record.linha}`;
+      const res = await fetch(url);
+      const data = await res.json();
+      if (data && String(data.valor).trim() === notaEsperada){
+        return { ok:true };
+      }
+      return { ok:false, motivo:'A planilha não confirmou o valor esperado.' };
+    }catch(e){
+      return { ok:false, motivo:'Enviado, mas não foi possível confirmar a leitura da planilha.' };
+    }
+  }
+
+  function addSessionLogEntry(text, ok){
+    const log = document.getElementById('sessionLog');
+    if (log.querySelector('.empty')) log.innerHTML = '';
+    const row = document.createElement('div');
+    row.className = 'result-row';
+    row.style.color = ok ? 'var(--green)' : 'var(--red)';
+    row.textContent = (ok ? '✓ ' : '✕ ') + text;
+    log.prepend(row);
   }
 
   /* ---------------- TABS ---------------- */
@@ -537,7 +548,6 @@
       document.querySelectorAll('.step').forEach(s=>s.classList.remove('active'));
       btn.classList.add('active');
       document.getElementById('step-'+btn.dataset.step).classList.add('active');
-      if (btn.dataset.step === 'results') renderStudentsTable();
     });
   });
 
@@ -844,81 +854,37 @@
   }
 
   document.getElementById('btnSave').addEventListener('click', async ()=>{
+    if (!state.sheetsUrl){ alert('Configure a integração com a planilha na aba Resultados primeiro.'); return; }
     const studentSelect = document.getElementById('studentSelect');
     const linha = studentSelect.value;
     const name = studentSelect.options[studentSelect.selectedIndex] ? studentSelect.options[studentSelect.selectedIndex].text : '';
     const sala = document.getElementById('salaSelect').value;
-    if (!linha){ alert('Selecione o aluno antes de salvar.'); return; }
+    if (!linha){ alert('Selecione o aluno antes de enviar.'); return; }
     const {correct,total,pct} = computeScoreValue();
-    const record = {
-      name, sala, linha,
-      date: new Date().toLocaleDateString('pt-BR'),
-      correct, total: total||40, pct,
-      answers: scan.detected.map(r=>r.letter)
-    };
-    state.students.push(record);
-    await saveStudents();
-    sendToSheet(record);
-    // reset scan step for next student
-    document.getElementById('studentSelect').value = '';
-    document.getElementById('alunosStatus').textContent = '';
-    canvas.style.display = 'none';
-    document.getElementById('reviewCard').style.display = 'none';
-    document.getElementById('btnProcess').disabled = true;
-    scan.corners = []; scan.detected = null;
-    document.getElementById('cornerStatus').textContent = '';
-    document.querySelector('nav.tabs button[data-step="results"]').click();
-  });
+    const record = { name, sala, linha, correct, total: total||40, pct };
 
-  /* ---------------- RESULTS TAB ---------------- */
-  function renderStudentsTable(){
-    const wrap = document.getElementById('resultsTableWrap');
-    if (!state.students.length){
-      wrap.innerHTML = '<div class="empty">Nenhum resultado salvo ainda.</div>';
-      return;
+    const btn = document.getElementById('btnSave');
+    btn.disabled = true;
+    btn.textContent = 'Enviando...';
+    const resultado = await sendToSheetAndVerify(record);
+    btn.disabled = false;
+    btn.textContent = 'Enviar para a planilha';
+
+    const rotulo = `${name} (${sala}) — ${correct}/${total||40}`;
+    if (resultado.ok){
+      addSessionLogEntry(rotulo, true);
+      // reset scan step para o próximo aluno
+      document.getElementById('studentSelect').value = '';
+      document.getElementById('alunosStatus').textContent = '';
+      canvas.style.display = 'none';
+      document.getElementById('reviewCard').style.display = 'none';
+      document.getElementById('btnProcess').disabled = true;
+      scan.corners = []; scan.detected = null;
+      document.getElementById('cornerStatus').textContent = '';
+    } else {
+      addSessionLogEntry(rotulo + ' — ' + resultado.motivo, false);
+      alert('Não foi possível confirmar o envio: ' + resultado.motivo + '\n\nO cartão continua na tela — toque em "Enviar para a planilha" para tentar de novo.');
     }
-    let html = '<table class="students"><thead><tr><th>Aluno</th><th>Sala</th><th>Data</th><th>Acertos</th><th></th></tr></thead><tbody>';
-    state.students.forEach((s, idx)=>{
-      const color = s.pct>=70 ? 'var(--green)' : (s.pct>=50 ? 'var(--blue)' : 'var(--red)');
-      html += `<tr>
-        <td>${escapeHtml(s.name)}</td>
-        <td>${escapeHtml(s.sala || '')}</td>
-        <td>${s.date}</td>
-        <td><span class="score-pill" style="background:${color};color:#fff;">${s.correct}/${s.total} · ${s.pct}%</span></td>
-        <td><button class="link" data-idx="${idx}">remover</button></td>
-      </tr>`;
-    });
-    html += '</tbody></table>';
-    wrap.innerHTML = html;
-    wrap.querySelectorAll('button.link[data-idx]').forEach(btn=>{
-      btn.addEventListener('click', async ()=>{
-        state.students.splice(parseInt(btn.dataset.idx,10), 1);
-        await saveStudents();
-        renderStudentsTable();
-      });
-    });
-  }
-
-  function escapeHtml(s){
-    return s.replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-  }
-
-  document.getElementById('btnExport').addEventListener('click', ()=>{
-    if (!state.students.length){ alert('Não há resultados para exportar.'); return; }
-    const letters = currentLetters();
-    const header = ['Nome','Sala','Data','Acertos','Total','Percentual', ...Array.from({length:40},(_,i)=>'Q'+(i+1))];
-    const rows = [header.join(';')];
-    state.students.forEach(s=>{
-      const row = [s.name, s.sala || '', s.date, s.correct, s.total, s.pct+'%', ...s.answers.map(a=>a||'')];
-      rows.push(row.join(';'));
-    });
-    const csv = '\uFEFF' + rows.join('\n');
-    const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = 'resultados_gabarito.csv';
-    document.body.appendChild(a); a.click(); document.body.removeChild(a);
-    URL.revokeObjectURL(url);
   });
 
   document.getElementById('btnSaveSheetsUrl').addEventListener('click', ()=>{
@@ -926,23 +892,8 @@
     state.sheetsUrl = url;
     try{ localStorage.setItem('gabarito_sheets_url', url); }catch(e){}
     document.getElementById('sheetsStatus').textContent = url
-      ? 'Integração salva. Novos alunos serão enviados automaticamente.'
+      ? 'Integração salva. As correções serão enviadas direto para a planilha.'
       : 'Integração removida.';
-  });
-
-  document.getElementById('btnResendAll').addEventListener('click', async ()=>{
-    if (!state.sheetsUrl){ alert('Cole e salve a URL do App da Web primeiro.'); return; }
-    if (!state.students.length){ alert('Não há resultados salvos para reenviar.'); return; }
-    document.getElementById('sheetsStatus').textContent = 'Reenviando...';
-    for (const s of state.students){ await sendToSheet(s); }
-    document.getElementById('sheetsStatus').textContent = `Reenvio concluído (${state.students.length} aluno(s)). Confira a planilha.`;
-  });
-
-  document.getElementById('btnClearAll').addEventListener('click', async ()=>{
-    if (!confirm('Apagar todos os resultados salvos?')) return;
-    state.students = [];
-    await saveStudents();
-    renderStudentsTable();
   });
 
   /* ---------------- INIT ---------------- */
@@ -953,7 +904,6 @@
     renderSalaSelect();
     renderKeyGrid();
     renderTemplate();
-    renderStudentsTable();
   })();
 
 })();
